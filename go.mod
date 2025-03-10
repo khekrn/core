@@ -1,6 +1,6 @@
 module github.com/khekrn/core
 
-go 1.23.5
+go 1.22.0
 
 require go.uber.org/zap v1.27.0
 
