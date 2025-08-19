@@ -231,7 +231,6 @@ func main() {
 - **Easy Maintenance**: Update base configuration in one place to affect all services
 - **Production Ready**: Inherited clients get retry and circuit breaker by default
 
-````
 
 ### Response Package
 
@@ -267,7 +266,7 @@ func main() {
     jsonData, _ := json.Marshal(successResp)
     fmt.Println(string(jsonData))
 }
-````
+```
 
 #### HTTP Handler Example
 
