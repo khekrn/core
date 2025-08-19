@@ -17,9 +17,6 @@ func ExampleRESTClient() {
 	// Create a basic client
 	basicClient := client.NewDefaultRESTClient()
 
-	// Create a production client with all features
-	prodClient := client.NewProductionRESTClient("https://api.example.com")
-
 	// Create a custom client with specific configuration
 	customClient := client.NewClientBuilder().
 		WithBaseURL("https://api.example.com").
@@ -31,12 +28,10 @@ func ExampleRESTClient() {
 
 	// Example API calls
 	fmt.Println("Basic client created:", basicClient != nil)
-	fmt.Println("Production client created:", prodClient != nil)
 	fmt.Println("Custom client created:", customClient != nil)
 
 	// Output:
 	// Basic client created: true
-	// Production client created: true
 	// Custom client created: true
 }
 
@@ -247,5 +242,148 @@ func TestRESTClient_AllHTTPMethods(t *testing.T) {
 				t.Errorf("Expected successful response for %s, got status %d", method, resp.StatusCode)
 			}
 		})
+	}
+}
+
+func TestFromSharedClient(t *testing.T) {
+	// Create test servers for different services
+	baseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only verify headers for non-minimal requests
+		// Minimal client requests go to "/minimal" and don't have default headers
+		if r.URL.Path != "/minimal" {
+			// Verify base client headers are present
+			if r.Header.Get("Authorization") != "Bearer base-token" {
+				t.Errorf("Expected Authorization header from base client, got '%s'", r.Header.Get("Authorization"))
+			}
+			if r.Header.Get("Content-Type") != "application/json" {
+				t.Errorf("Expected Content-Type header from base client, got '%s'", r.Header.Get("Content-Type"))
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"service": "base", "status": "success"}`))
+	}))
+	defer baseServer.Close()
+
+	plexServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Verify inherited headers
+		if r.Header.Get("Authorization") != "Bearer base-token" {
+			t.Errorf("Expected inherited Authorization header, got '%s'", r.Header.Get("Authorization"))
+		}
+		if r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("Expected inherited Content-Type header, got '%s'", r.Header.Get("Content-Type"))
+		}
+		// Verify service-specific headers
+		if r.Header.Get("X-Service") != "plex" {
+			t.Errorf("Expected X-Service header 'plex', got '%s'", r.Header.Get("X-Service"))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"service": "plex", "status": "success"}`))
+	}))
+	defer plexServer.Close()
+
+	// Step 1: Create base sample client with configuration
+	sampleClient := client.NewClientBuilder().
+		WithBaseURL(baseServer.URL).
+		WithTimeout(20*time.Second).
+		WithDefaultHeader("Authorization", "Bearer base-token").
+		WithDefaultHeader("Content-Type", "application/json").
+		WithDefaultHeader("User-Agent", "base-client/1.0").
+		Build()
+
+	// Step 2: Test base client works
+	resp, err := sampleClient.GET("/test")
+	if err != nil {
+		t.Fatalf("Base client GET failed: %v", err)
+	}
+	if !resp.IsSuccess() {
+		t.Errorf("Expected successful response from base client, got %d", resp.StatusCode)
+	}
+
+	// Step 3: Create plexClient inheriting from sampleClient
+	plexClient := client.FromSharedClient(sampleClient, "plex-service", plexServer.URL).
+		WithTimeout(30*time.Second).            // Override timeout
+		WithDefaultHeader("X-Service", "plex"). // Add service-specific header
+		Build()
+
+	// Step 4: Test plexClient inherits configuration
+	resp2, err := plexClient.GET("/plex/test")
+	if err != nil {
+		t.Fatalf("Plex client GET failed: %v", err)
+	}
+	if !resp2.IsSuccess() {
+		t.Errorf("Expected successful response from plex client, got %d", resp2.StatusCode)
+	}
+
+	// Step 5: Verify configuration inheritance and overrides
+	// Test that plexClient inherited the base timeout but overrode it
+	baseTimeout := sampleClient.GetInstance().Timeout
+	plexTimeout := plexClient.GetInstance().Timeout
+
+	if baseTimeout != 20*time.Second {
+		t.Errorf("Expected base client timeout 20s, got %v", baseTimeout)
+	}
+	if plexTimeout != 30*time.Second {
+		t.Errorf("Expected plex client timeout 30s, got %v", plexTimeout)
+	}
+
+	// Step 6: Create orderClient inheriting base URL
+	orderClient := client.FromSharedClient(sampleClient, "order-service", "").
+		WithDefaultHeader("X-API-Version", "v2").
+		Build()
+
+	// Test that orderClient inherited base URL
+	resp3, err := orderClient.GET("/orders")
+	if err != nil {
+		t.Fatalf("Order client GET failed: %v", err)
+	}
+	if !resp3.IsSuccess() {
+		t.Errorf("Expected successful response from order client, got %d", resp3.StatusCode)
+	}
+
+	// Step 7: Test clients without retry/circuit breaker
+	minimalClient := client.NewClientBuilder().
+		WithBaseURL(baseServer.URL).
+		WithoutRetry().
+		WithoutCircuitBreaker().
+		Build()
+
+	resp4, err := minimalClient.GET("/minimal")
+	if err != nil {
+		t.Fatalf("Minimal client GET failed: %v", err)
+	}
+	if !resp4.IsSuccess() {
+		t.Errorf("Expected successful response from minimal client, got %d", resp4.StatusCode)
+	}
+}
+
+func TestDefaultRetryAndCircuitBreaker(t *testing.T) {
+	// Create a server that returns errors
+	errorServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("Server Error"))
+	}))
+	defer errorServer.Close()
+
+	// Create client with the error server and default settings
+	errorClient := client.NewClientBuilder().
+		WithBaseURL(errorServer.URL).
+		Build()
+
+	// This should retry multiple times due to default retry configuration
+	start := time.Now()
+	_, err := errorClient.GET("/error")
+	duration := time.Since(start)
+
+	// Should take longer than a single request due to retries
+	if duration < 100*time.Millisecond {
+		t.Error("Expected retry behavior with backoff, but request completed too quickly")
+	}
+
+	if err == nil {
+		t.Error("Expected error due to server errors, but got success")
 	}
 }

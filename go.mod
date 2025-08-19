@@ -4,7 +4,7 @@ go 1.24.4
 
 require (
 	github.com/DataDog/dd-trace-go/contrib/net/http/v2 v2.1.0
-	github.com/sony/gobreaker v1.0.0
+	github.com/sony/gobreaker/v2 v2.2.0
 	go.uber.org/zap v1.27.0
 )
 

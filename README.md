@@ -27,12 +27,15 @@ A production-ready REST client with advanced features including circuit breaker,
 #### Features
 
 - ✅ All HTTP methods (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS)
-- ✅ Circuit breaker for fault tolerance
+- ✅ Circuit breaker for fault tolerance (gobreaker v2.2.0)
 - ✅ Configurable retry with exponential backoff
 - ✅ Context support for timeouts and cancellation
 - ✅ Datadog tracing integration
 - ✅ Builder pattern for flexible configuration
 - ✅ Request/response middleware support
+- ✅ **Shared client configuration** - inherit settings across multiple services
+- ✅ **Production-ready defaults** - retry and circuit breaker enabled by default
+- ✅ **Flexible disabling** - opt-out of defaults when needed
 
 #### Basic Usage
 
@@ -42,16 +45,20 @@ package main
 import (
     "fmt"
     "log"
+    "time"
 
     "github.com/khekrn/core/client"
 )
 
 func main() {
-    // Create a basic REST client
-    restClient := client.NewDefaultRESTClient()
+    // Create a production-ready client with defaults (includes retry + circuit breaker)
+    restClient := client.NewClientBuilder().
+        WithBaseURL("https://jsonplaceholder.typicode.com").
+        WithTimeout(10 * time.Second).
+        Build()
 
     // Simple GET request
-    resp, err := restClient.GET("https://jsonplaceholder.typicode.com/users/1")
+    resp, err := restClient.GET("/users/1")
     if err != nil {
         log.Fatal(err)
     }
@@ -65,17 +72,28 @@ func main() {
 #### Production Usage
 
 ```go
-// Create a production-ready client with all features
-prodClient := client.NewProductionRESTClient("https://api.example.com")
+// Create a client with production defaults (includes retry and circuit breaker)
+prodClient := client.NewClientBuilder().
+    WithBaseURL("https://api.example.com").
+    WithTimeout(30 * time.Second).
+    WithDefaultHeader("Authorization", "Bearer token").
+    Build() // ✨ Includes default retry and circuit breaker automatically
 
 // Custom client with specific configuration
 customClient := client.NewClientBuilder().
     WithBaseURL("https://api.example.com").
     WithTimeout(30 * time.Second).
     WithDefaultHeader("Authorization", "Bearer token").
-    WithDefaultRetry().
-    WithDefaultCircuitBreaker("my-service").
+    WithRetry(5, 100*time.Millisecond).  // Custom retry config
+    WithCircuitBreaker("my-service", 5, 30*time.Second).  // Custom circuit breaker
     WithDatadog(true).
+    Build()
+
+// Minimal client without retry/circuit breaker for specific use cases
+minimalClient := client.NewClientBuilder().
+    WithBaseURL("https://api.example.com").
+    WithoutRetry().           // Disable default retry
+    WithoutCircuitBreaker().  // Disable default circuit breaker
     Build()
 
 // HTTP requests with options
@@ -138,6 +156,83 @@ if err := resp.JSON(&user); err != nil {
 responseText := resp.String()
 ```
 
+#### Shared Client Configuration
+
+Create reusable base clients and inherit their configuration across multiple services. Perfect for microservice architectures where you want consistent configuration with service-specific customizations.
+
+```go
+package main
+
+import (
+    "time"
+    "github.com/khekrn/core/client"
+)
+
+func main() {
+    // Step 1: Create a base client with common configuration
+    baseClient := client.NewClientBuilder().
+        WithBaseURL("https://api.company.com").
+        WithTimeout(20 * time.Second).
+        WithDefaultHeader("Authorization", "Bearer company-token").
+        WithDefaultHeader("Content-Type", "application/json").
+        WithDefaultHeader("User-Agent", "company-client/1.0").
+        WithDefaultHeader("X-Company-ID", "12345").
+        Build()
+
+    // Step 2: Create service-specific clients that inherit base configuration
+
+    // User service client - inherits all base settings + adds service-specific headers
+    userClient := client.FromSharedClient(baseClient, "user-service", "https://users.company.com").
+        WithTimeout(30 * time.Second).              // Override timeout for this service
+        WithDefaultHeader("X-Service", "users").    // Add service-specific header
+        WithDefaultHeader("X-Version", "v2").       // Add API version header
+        Build()
+
+    // Order service client - inherits base URL when service URL is empty
+    orderClient := client.FromSharedClient(baseClient, "order-service", "").
+        WithDefaultHeader("X-Service", "orders").
+        WithDefaultHeader("X-Priority", "high").
+        Build()
+
+    // Payment service client - inherits everything + custom circuit breaker settings
+    paymentClient := client.FromSharedClient(baseClient, "payment-service", "https://payments.company.com").
+        WithTimeout(45 * time.Second).                           // Longer timeout for payments
+        WithCircuitBreaker("payments", 3, 60*time.Second).      // Stricter circuit breaker
+        WithDefaultHeader("X-Service", "payments").
+        WithDefaultHeader("X-Security-Level", "high").
+        Build()
+
+    // Step 3: Use the clients - each inherits base configuration + their customizations
+
+    // All requests from userClient will include:
+    // - Authorization: Bearer company-token (inherited)
+    // - Content-Type: application/json (inherited)
+    // - User-Agent: company-client/1.0 (inherited)
+    // - X-Company-ID: 12345 (inherited)
+    // - X-Service: users (service-specific)
+    // - X-Version: v2 (service-specific)
+    // - 30 second timeout (overridden)
+    userResp, err := userClient.GET("/users/123")
+
+    // All requests from orderClient will include inherited headers + X-Service: orders
+    // and use the base URL since no service URL was provided
+    orderResp, err := orderClient.GET("/orders/456")
+
+    // Payment client has all inherited config + custom circuit breaker + payment headers
+    paymentResp, err := paymentClient.POST("/charges", chargeData)
+}
+```
+
+**Benefits of Shared Client Configuration:**
+
+- **Consistency**: All service clients share common authentication, headers, and base configuration
+- **DRY Principle**: Define common settings once, inherit everywhere
+- **Service Customization**: Each service can override or add specific configuration
+- **Easy Maintenance**: Update base configuration in one place to affect all services
+- **Production Ready**: Inherited clients get retry and circuit breaker by default
+
+````
+
 ### Response Package
 
 Standardized response structures for consistent API responses across microservices.
@@ -172,7 +267,7 @@ func main() {
     jsonData, _ := json.Marshal(successResp)
     fmt.Println(string(jsonData))
 }
-```
+````
 
 #### HTTP Handler Example
 
@@ -510,7 +605,7 @@ go test ./client -bench=.
 ## 📋 Dependencies
 
 - `go.uber.org/zap` - High-performance logging
-- `github.com/sony/gobreaker` - Circuit breaker implementation
+- `github.com/sony/gobreaker/v2` - Circuit breaker implementation (v2.2.0)
 - `github.com/DataDog/dd-trace-go` - Datadog tracing (optional)
 
 ## 🤝 Contributing

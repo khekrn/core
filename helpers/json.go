@@ -58,6 +58,12 @@ func FromJSONValue[T any](jsonData []byte) (T, error) {
 	return result, nil
 }
 
+// UnmarshalJSON unmarshals JSON bytes into the provided interface
+// This is a compatibility function for working with interface{} types
+func UnmarshalJSON(jsonData []byte, v interface{}) error {
+	return json.Unmarshal(jsonData, v)
+}
+
 // FromReader reads JSON from an io.Reader and converts it to a struct
 func FromReader[T any](reader io.Reader) (*T, error) {
 	data, err := io.ReadAll(reader)

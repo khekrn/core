@@ -3,23 +3,30 @@
 //
 // This package offers production-ready HTTP client functionality with
 // fault tolerance, observability, and flexible configuration options.
+// All clients created with NewClientBuilder() include default retry logic
+// and circuit breaker functionality for improved resilience.
 //
 // Example usage:
 //
-//	// Basic client
+//	// Basic client (includes default retry and circuit breaker)
 //	client := client.NewDefaultRESTClient()
 //	resp, err := client.GET("https://api.example.com/users")
 //
-//	// Production client with all features
-//	prodClient := client.NewProductionRESTClient("https://api.example.com")
-//
-//	// Custom client
-//	customClient := client.NewClientBuilder().
+//	// Custom client with shared configuration
+//	sampleClient := client.NewClientBuilder().
+//		WithDefaultHeader("Authorization", "Bearer token").
 //		WithBaseURL("https://api.example.com").
-//		WithTimeout(30 * time.Second).
-//		WithDefaultRetry().
-//		WithDefaultCircuitBreaker("my-service").
-//		WithDatadog(true).
+//		Build()
+//
+//	// Create derived client from shared client
+//	plexClient := client.FromSharedClient(sampleClient, "plex-service", "https://plex-api.example.com").
+//		WithDefaultHeader("X-Plex-Token", "token123").
+//		Build()
+//
+//	// Minimal client without retry/circuit breaker
+//	minimalClient := client.NewClientBuilder().
+//		WithoutRetry().
+//		WithoutCircuitBreaker().
 //		Build()
 //
 //	// Request with options
@@ -33,7 +40,6 @@ package client
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,7 +47,8 @@ import (
 	"time"
 
 	ddhttp "github.com/DataDog/dd-trace-go/contrib/net/http/v2"
-	"github.com/sony/gobreaker"
+	"github.com/khekrn/core/helpers"
+	"github.com/sony/gobreaker/v2"
 )
 
 // HTTPMethod represents supported HTTP methods
@@ -100,7 +107,7 @@ type RESTClient struct {
 	baseURL        string
 	defaultHeaders map[string]string
 	retry          *RetryConfig
-	circuitBreaker *gobreaker.CircuitBreaker
+	circuitBreaker *gobreaker.CircuitBreaker[*http.Response]
 }
 
 // ClientBuilder provides a fluent interface for building REST clients
@@ -117,7 +124,7 @@ type ClientBuilder struct {
 	circuitBreaker      *CircuitBreakerConfig
 }
 
-// NewClientBuilder creates a new client builder with sensible defaults
+// NewClientBuilder creates a new client builder with sensible defaults including retry and circuit breaker
 func NewClientBuilder() *ClientBuilder {
 	return &ClientBuilder{
 		timeout:             30 * time.Second,
@@ -126,7 +133,103 @@ func NewClientBuilder() *ClientBuilder {
 		idleConnTimeout:     90 * time.Second,
 		enableDatadog:       false,
 		defaultHeaders:      make(map[string]string),
+		retry: &RetryConfig{
+			MaxAttempts:    3,
+			InitialBackoff: 100 * time.Millisecond,
+			MaxBackoff:     5 * time.Second,
+			BackoffFactor:  2.0,
+		},
+		circuitBreaker: &CircuitBreakerConfig{
+			Name:        "default-client",
+			MaxRequests: 3,
+			Interval:    10 * time.Second,
+			Timeout:     60 * time.Second,
+			ReadyToTrip: func(counts gobreaker.Counts) bool {
+				failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+				return counts.Requests >= 3 && failureRatio >= 0.6
+			},
+		},
 	}
+}
+
+// FromSharedClient creates a new client builder that inherits configuration from an existing RESTClient
+func FromSharedClient(restClient *RESTClient, name string, baseURL string) *ClientBuilder {
+	builder := &ClientBuilder{
+		// Share the underlying HTTP client for connection pooling efficiency
+		transport:      restClient.client.Transport,
+		timeout:        restClient.client.Timeout,
+		enableDatadog:  detectDatadogEnabled(restClient.client),
+		baseURL:        baseURL,
+		defaultHeaders: make(map[string]string),
+	}
+
+	// If no baseURL provided, inherit from the shared client
+	if baseURL == "" {
+		builder.baseURL = restClient.baseURL
+	}
+
+	// Copy default headers
+	for k, v := range restClient.defaultHeaders {
+		builder.defaultHeaders[k] = v
+	}
+
+	// Copy retry configuration if present
+	if restClient.retry != nil {
+		builder.retry = &RetryConfig{
+			MaxAttempts:    restClient.retry.MaxAttempts,
+			InitialBackoff: restClient.retry.InitialBackoff,
+			MaxBackoff:     restClient.retry.MaxBackoff,
+			BackoffFactor:  restClient.retry.BackoffFactor,
+		}
+	}
+
+	// Extract connection settings from existing transport if it's a standard HTTP transport
+	if transport, ok := restClient.client.Transport.(*http.Transport); ok {
+		builder.maxIdleConns = transport.MaxIdleConns
+		builder.maxIdleConnsPerHost = transport.MaxIdleConnsPerHost
+		builder.idleConnTimeout = transport.IdleConnTimeout
+	} else {
+		// Set defaults if we can't extract from transport
+		builder.maxIdleConns = 100
+		builder.maxIdleConnsPerHost = 100
+		builder.idleConnTimeout = 90 * time.Second
+	}
+
+	// Don't copy circuit breaker - each service should have its own
+	// Use the provided name for the circuit breaker
+	circuitBreakerName := name
+	if circuitBreakerName == "" {
+		circuitBreakerName = "shared-client-derived"
+	}
+
+	builder.circuitBreaker = &CircuitBreakerConfig{
+		Name:        circuitBreakerName,
+		MaxRequests: 3,
+		Interval:    10 * time.Second,
+		Timeout:     60 * time.Second,
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+			return counts.Requests >= 3 && failureRatio >= 0.6
+		},
+	}
+
+	return builder
+}
+
+// detectDatadogEnabled attempts to detect if Datadog tracing is enabled on the HTTP client
+func detectDatadogEnabled(client *http.Client) bool {
+	if client == nil || client.Transport == nil {
+		return false
+	}
+
+	// Check if the transport is wrapped by Datadog
+	// ddhttp.WrapClient creates a wrapper transport, so we need to check the type
+	transportType := fmt.Sprintf("%T", client.Transport)
+
+	// Datadog wrapped transports typically have "datadog" or "dd" in their type name
+	return strings.Contains(strings.ToLower(transportType), "datadog") ||
+		strings.Contains(strings.ToLower(transportType), "dd") ||
+		strings.Contains(strings.ToLower(transportType), "roundtripper")
 }
 
 // WithTimeout sets the client timeout
@@ -191,6 +294,12 @@ func (b *ClientBuilder) WithRetry(config RetryConfig) *ClientBuilder {
 	return b
 }
 
+// WithoutRetry disables retry functionality
+func (b *ClientBuilder) WithoutRetry() *ClientBuilder {
+	b.retry = nil
+	return b
+}
+
 // WithDefaultRetry configures retry with sensible defaults
 func (b *ClientBuilder) WithDefaultRetry() *ClientBuilder {
 	b.retry = &RetryConfig{
@@ -205,6 +314,12 @@ func (b *ClientBuilder) WithDefaultRetry() *ClientBuilder {
 // WithCircuitBreaker configures circuit breaker
 func (b *ClientBuilder) WithCircuitBreaker(config CircuitBreakerConfig) *ClientBuilder {
 	b.circuitBreaker = &config
+	return b
+}
+
+// WithoutCircuitBreaker disables circuit breaker functionality
+func (b *ClientBuilder) WithoutCircuitBreaker() *ClientBuilder {
+	b.circuitBreaker = nil
 	return b
 }
 
@@ -262,7 +377,7 @@ func (b *ClientBuilder) Build() *RESTClient {
 			Timeout:     b.circuitBreaker.Timeout,
 			ReadyToTrip: b.circuitBreaker.ReadyToTrip,
 		}
-		restClient.circuitBreaker = gobreaker.NewCircuitBreaker(settings)
+		restClient.circuitBreaker = gobreaker.NewCircuitBreaker[*http.Response](settings)
 	}
 
 	return restClient
@@ -271,17 +386,6 @@ func (b *ClientBuilder) Build() *RESTClient {
 // NewDefaultRESTClient creates a default REST client
 func NewDefaultRESTClient() *RESTClient {
 	return NewClientBuilder().Build()
-}
-
-// NewProductionRESTClient creates a production-ready REST client with all features
-func NewProductionRESTClient(baseURL string) *RESTClient {
-	return NewClientBuilder().
-		WithBaseURL(baseURL).
-		WithDatadog(true).
-		WithDefaultRetry().
-		WithDefaultCircuitBreaker("production-client").
-		WithDefaultHeader("User-Agent", "core-rest-client/1.0").
-		Build()
 }
 
 // GetInstance returns the underlying http.Client instance
@@ -311,8 +415,8 @@ func (rc *RESTClient) createRequest(config RequestConfig) (*http.Request, error)
 		case io.Reader:
 			body = v
 		default:
-			// JSON encode the body
-			jsonData, err := json.Marshal(config.Body)
+			// JSON encode the body using helpers package
+			jsonData, err := helpers.ToJSON(config.Body)
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal body: %w", err)
 			}
@@ -397,13 +501,13 @@ func (rc *RESTClient) executeRequest(req *http.Request) (*Response, error) {
 	var err error
 
 	if rc.circuitBreaker != nil {
-		result, cbErr := rc.circuitBreaker.Execute(func() (interface{}, error) {
+		result, cbErr := rc.circuitBreaker.Execute(func() (*http.Response, error) {
 			return rc.client.Do(req)
 		})
 		if cbErr != nil {
 			return nil, fmt.Errorf("circuit breaker: %w", cbErr)
 		}
-		resp = result.(*http.Response)
+		resp = result
 	} else {
 		resp, err = rc.client.Do(req)
 		if err != nil {
@@ -593,9 +697,9 @@ func WithContext(ctx context.Context) RequestOption {
 	}
 }
 
-// JSON parses the response body as JSON
+// JSON parses the response body as JSON using helpers package
 func (r *Response) JSON(v interface{}) error {
-	return json.Unmarshal(r.Body, v)
+	return helpers.UnmarshalJSON(r.Body, v)
 }
 
 // String returns the response body as a string
